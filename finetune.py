@@ -6,11 +6,12 @@ from datetime import datetime
 import argparse
 import torch
 import torch.nn.functional as F
-from private_transformers import PrivacyEngine
 import os
 from tqdm.auto import tqdm
 # Add PEFT library imports for LoRA
 from peft import get_peft_model, LoraConfig, TaskType
+import private_transformers.privacy_engine as pe_module
+
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Fine-tune models with optional differential privacy')
@@ -139,11 +140,6 @@ def train_model_on_dataset(dataset_name):
     if finetune_mode == 'lora':
         print(f"Fine-tuning mode: {finetune_mode} - Using LoRA with rank={lora_config['r']}, alpha={lora_config['alpha']}, dropout={lora_config['dropout']}")
         
-        # Trick private_transformers to use LoRA
-        from private_transformers import settings
-        import peft
-        settings.SUPPORTED_TRANSFORMERS = settings.SUPPORTED_TRANSFORMERS + (peft.peft_model.PeftModelForSequenceClassification,)
-        
         # Configure LoRA
         peft_config = LoraConfig(
             task_type=TaskType.SEQ_CLS,
@@ -258,8 +254,12 @@ def train_model_on_dataset(dataset_name):
             "ignore", 
             message="Using a non-full backward hook when the forward contains multiple autograd Nodes is deprecated"
         )
+
+        # monkey-patch private_transformers package bypass unsupported models
+        if finetune_mode == 'lora':
+            pe_module.SUPPORTED_TRANSFORMERS += (type(model),)
         
-        privacy_engine = PrivacyEngine(
+        privacy_engine = pe_module.PrivacyEngine(
             model,
             batch_size=batch_size * (torch.cuda.device_count() if torch.cuda.is_available() else 1),
             sample_size=len(tokenized_dataset["train"]),
