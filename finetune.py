@@ -9,13 +9,16 @@ import torch.nn.functional as F
 from private_transformers import PrivacyEngine
 import os
 from tqdm.auto import tqdm
+# Add PEFT library imports for LoRA
+from peft import get_peft_model, LoraConfig, TaskType
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Fine-tune models with optional differential privacy')
-parser.add_argument('--finetune_mode', type=str, default='full', choices=['full', 'last-layer'], 
-                    help='Fine-tuning mode: "full" for all layers or "last-layer" for classifier only')
+parser.add_argument('--finetune_mode', type=str, default='full', 
+                    choices=['full', 'last-layer', 'lora', 'ai3'], 
+                    help='Fine-tuning mode: "full" for all layers, "last-layer" for classifier only, "lora" for LoRA, or "ai3" for AI3 method')
 parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for optimizer')
-parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs')
+parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
 parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training and evaluation')
 # Differential Privacy arguments
 parser.add_argument('--enable_dp', action='store_true', help='Enable differential privacy during training')
@@ -25,6 +28,10 @@ parser.add_argument('--max_grad_norm', type=float, default=0.1, help='Maximum L2
 parser.add_argument('--datasets', nargs='+', default=["sst2", "qnli", "qqp", "mnli"],
                    choices=["sst2", "qnli", "qqp", "mnli"], 
                    help='List of datasets to train on, space separated (e.g., --datasets sst2 qnli)')
+# LoRA arguments
+parser.add_argument('--lora_r', type=int, default=8, help='Rank of the LoRA matrices')
+parser.add_argument('--lora_alpha', type=int, default=16, help='Scaling factor for LoRA')
+parser.add_argument('--lora_dropout', type=float, default=0.1, help='Dropout probability for LoRA layers')
 args = parser.parse_args()
 
 # Model configuration
@@ -41,6 +48,13 @@ enable_dp = args.enable_dp
 dp_config = {
     'target_epsilon': args.target_epsilon,
     'max_grad_norm': args.max_grad_norm,
+}
+
+# LoRA configuration
+lora_config = {
+    'r': args.lora_r,
+    'alpha': args.lora_alpha,
+    'dropout': args.lora_dropout,
 }
 
 # Dataset configuration
@@ -102,6 +116,7 @@ def evaluate_model(model, eval_dataloader, device, num_labels):
 def train_model_on_dataset(dataset_name):
     print(f">> Training on {dataset_name} dataset... (ε={dp_config['target_epsilon'] if enable_dp else '∞'}, δ={dp_config['max_grad_norm'] if enable_dp else '∞'})")
     print(f"   Learning rate: {learning_rate}, Batch size: {batch_size}, Epochs: {epochs}")
+    print(f"   Fine-tuning mode: {finetune_mode}")
     
     # Load dataset
     dataset = load_dataset("glue", dataset_name)
@@ -117,12 +132,64 @@ def train_model_on_dataset(dataset_name):
     
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
     
-    # If fine-tuning only the last layer, freeze all other parameters
+    # Setup trainable parameters based on fine-tuning mode
     trainable_params = []
-    if finetune_mode == 'last-layer':
+    
+    if finetune_mode == 'lora':
+        print(f"Fine-tuning mode: {finetune_mode} - Using LoRA with rank={lora_config['r']}, alpha={lora_config['alpha']}, dropout={lora_config['dropout']}")
+        
+        # Trick private_transformers to use LoRA
+        from private_transformers import settings
+        import peft
+        settings.SUPPORTED_TRANSFORMERS = settings.SUPPORTED_TRANSFORMERS + (peft.peft_model.PeftModelForSequenceClassification,)
+        
+        # Configure LoRA
+        peft_config = LoraConfig(
+            task_type=TaskType.SEQ_CLS,
+            r=lora_config['r'],
+            lora_alpha=lora_config['alpha'],
+            lora_dropout=lora_config['dropout'],
+            bias="none",
+            target_modules=["query", "key", "value"]
+        )
+        
+        # Get the PEFT model
+        model = get_peft_model(model, peft_config)
+        # Move to device after LoRA transformation
+        model = model.to(device)
+        
+        # Get trainable parameters
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        
+        # Calculate trainable parameters
+        trainable_param_count = sum(p.numel() for p in trainable_params)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Trainable parameters: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)")
+    
+    elif finetune_mode == 'ai3':
+        print(f"Fine-tuning mode: {finetune_mode} - Only training attention and intermediate layers")
+        model = model.to(device)
+        
+        # Freeze all layers first
+        for param in model.parameters():
+            param.requires_grad = False
+        
+        # Only unfreeze attention and intermediate layers (AI3 approach)
+        for name, param in model.named_parameters():
+            if any(keyword in name for keyword in ["attention", "intermediate", "classifier"]):
+                param.requires_grad = True
+                trainable_params.append(param)
+        
+        # Calculate trainable parameters
+        trainable_param_count = sum(p.numel() for p in trainable_params)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Trainable parameters: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)")
+    
+    elif finetune_mode == 'last-layer':
         print(f"Fine-tuning mode: {finetune_mode} - Only training the classifier layer")
+        model = model.to(device)
+        
         # Freeze all layers except the classifier
         for name, param in model.named_parameters():
             if 'classifier' in name:
@@ -135,8 +202,10 @@ def train_model_on_dataset(dataset_name):
         trainable_param_count = sum(p.numel() for p in trainable_params)
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Trainable parameters: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)")
-    else:
+    
+    else:  # full fine-tuning
         print(f"Fine-tuning mode: {finetune_mode} - Training all parameters")
+        model = model.to(device)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Trainable parameters: {total_params} (100% of total)")
@@ -176,8 +245,8 @@ def train_model_on_dataset(dataset_name):
         betas=(0.9, 0.999)
     )
     
-    # Setup output directory
-    output_dir = f"./results/{dataset_name}_{'dp_' if enable_dp else ''}{datetime.now().strftime('%y%m%d.%H%M%S')}"
+    # Setup output directory with mode info in name
+    output_dir = f"./results/{dataset_name}_{finetune_mode}_{'dp_' if enable_dp else ''}{datetime.now().strftime('%y%m%d.%H%M%S')}"
     os.makedirs(output_dir, exist_ok=True)
     
     # Initialize privacy engine if DP is enabled
@@ -302,9 +371,12 @@ for dataset_name in datasets_to_train:
 
 # Print summary of results with DP information
 print("\n===== SUMMARY OF RESULTS =====")
-print(f"Training with Differential Privacy (ε={dp_config['target_epsilon'] if enable_dp else '∞'}, δ={dp_config['max_grad_norm'] if enable_dp else '∞'})")
-# print args
+print(f"Training with Differential Privacy: {enable_dp}")
+if enable_dp:
+    print(f"  ε={dp_config['target_epsilon']}, δ={dp_config['max_grad_norm']}")
 print(f"Fine-tuning mode: {finetune_mode}")
+if finetune_mode == 'lora':
+    print(f"  LoRA config: rank={lora_config['r']}, alpha={lora_config['alpha']}, dropout={lora_config['dropout']}")
 print(f"Learning rate: {learning_rate}")
 print(f"Batch size: {batch_size}")
 print(f"Epochs: {epochs}")
