@@ -242,7 +242,7 @@ def train_model_on_dataset(dataset_name):
     )
     
     # Setup output directory with mode info in name
-    output_dir = f"./results/{dataset_name}_{finetune_mode}_{'dp_' if enable_dp else ''}{datetime.now().strftime('%y%m%d.%H%M%S')}"
+    output_dir = f"./logs/{dataset_name}_{finetune_mode}_{'dp_' if enable_dp else ''}{datetime.now().strftime('%y%m%d.%H%M%S')}"
     os.makedirs(output_dir, exist_ok=True)
     
     # Initialize privacy engine if DP is enabled
@@ -352,9 +352,6 @@ def train_model_on_dataset(dataset_name):
     print(f"\n===== {dataset_name.upper()} RESULTS =====")
     print(f"  Best accuracy: {best_accuracy:.4f}")
     print(f"  Final accuracy: {final_eval_results['accuracy']:.4f}")
-    # print("  Training details:")
-    # for metric in train_metrics:
-    #     print(f"    Epoch {metric['epoch']}: loss={metric['train_loss']:.4f}, accuracy={metric['eval_accuracy']:.4f}")
     print("=" * 30)
     
     final_eval_results["best_accuracy"] = best_accuracy
