@@ -1,11 +1,5 @@
 import torch
 import torch.nn as nn
-# --- Add Opacus imports ---
-from opacus.grad_sample import register_grad_sampler
-# --- End Opacus imports ---
-# Import necessary layer types if not already imported by Opacus internals
-from torch.nn import Embedding, LayerNorm, Linear
-from typing import Dict, Tuple # For type hinting
 import os # Added for path operations
 import json # Added for saving config
 
@@ -68,8 +62,8 @@ class SoftPromptEmbedding(nn.Module):
     def forward(self, batch_size):
         # Expand prompt for the batch
         return self.soft_prompt.unsqueeze(0).expand(batch_size, -1, -1)
-
-
+    
+    
 class SoftPromptModel(nn.Module):
     def __init__(self, base_model, prompt_length=10):
         super().__init__()
@@ -81,15 +75,17 @@ class SoftPromptModel(nn.Module):
 
         self.soft_prompt_module = SoftPromptEmbedding(prompt_length, embedding_dim, model_device)
 
-        # Freeze base model
+        # Freeze base model initially
         for param in self.base_model.parameters():
             param.requires_grad = False
 
-        # Only optimize soft prompt + classifier
+        # Make soft prompt trainable.
         self.trainable_params = (
             list(self.soft_prompt_module.parameters()) +
             list(self.base_model.classifier.parameters())
         )
+
+        # Set requires_grad for the selected trainable parameters.
         for param in self.trainable_params:
             param.requires_grad = True
 

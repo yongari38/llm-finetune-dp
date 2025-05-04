@@ -10,7 +10,8 @@ import torch.nn.functional as F
 import os
 from tqdm.auto import tqdm
 # Add PEFT library imports for LoRA, Prefix Tuning, and Prompt Tuning
-from peft import get_peft_model, LoraConfig, TaskType, PrefixTuningConfig, PromptTuningConfig
+from peft import get_peft_model, LoraConfig, TaskType, PrefixTuningConfig, PromptTuningConfig, PeftMixedModel
+
 # Import manual IA3 wrapper from custom_models
 import private_transformers.privacy_engine as pe_module
 import logging
@@ -134,8 +135,8 @@ def evaluate_model(model, eval_dataloader, device, num_labels):
 # Main training function
 def train_model_on_dataset(dataset_name):
     print(f">> Training on {dataset_name} dataset...",
-          f" (ε={dp_config['target_epsilon'] if enable_dp else '∞'},",
-          f" clip_grad={dp_config['max_grad_norm'] if enable_dp else '∞'})")
+          f"(ε={dp_config['target_epsilon'] if enable_dp else '∞'},",
+          f"clip_grad={dp_config['max_grad_norm'] if enable_dp else '∞'})")
     print(f"   Learning rate: {learning_rate}, Batch size: {batch_size}, Epochs: {epochs}")
     
     # Load dataset
@@ -213,22 +214,14 @@ def train_model_on_dataset(dataset_name):
         from custom_models import SoftPromptModel
         model = SoftPromptModel(model, prompt_length=prefix_prompt_config['num_prepend_tokens'])
         
-        
         for name, param in model.named_parameters():
             if 'classifier' in name:
                 param.requires_grad = True
 
     elif finetune_mode == 'soft-prompt+lora':
-        print(f"   Fine-tuning mode: {finetune_mode} - Using Soft-prompt Tuning ({prefix_prompt_config['num_prepend_tokens']} tokens) + LoRA (r={lora_config['r']}, alpha={lora_config['alpha']})")
-        
-        # 1. Apply Soft Prompt Tuning
-        prompt_config = PromptTuningConfig(
-            task_type=TaskType.SEQ_CLS,
-            num_virtual_tokens=prefix_prompt_config['num_prepend_tokens']   
-        )
-        model = get_peft_model(model, prompt_config)
+        print(f"   Fine-tuning mode: {finetune_mode} - Using LoRA (r={lora_config['r']}, alpha={lora_config['alpha']}) + Soft-prompt Tuning ({prefix_prompt_config['num_prepend_tokens']} tokens)")
 
-        # 2. Apply LoRA on top
+        # 1. Apply LoRA first
         lora_peft_config = LoraConfig(
             task_type=TaskType.SEQ_CLS,
             r=lora_config['r'],
@@ -236,9 +229,21 @@ def train_model_on_dataset(dataset_name):
             lora_dropout=lora_config['dropout'],
             bias="none",
             target_modules=["query", "key", "value"], # Apply LoRA to attention layers
-            modules_to_save=["classifier"], # Will be set as trainable and saved in the final checkpoint
+            # modules_to_save=None, #["classifier"], # Classifier is trainable by default
+            # exclude_modules=["classifier"], # Exclude classifier from LoRA -> will be handled by SoftPromptModel
         )
-        model = get_peft_model(model, lora_peft_config) # Apply LoRA to the prompt-tuned model
+        model = get_peft_model(model, lora_peft_config) # Apply LoRA to the base model
+
+        # 2. Wrap the LoRA-adapted model with SoftPromptModel
+        from custom_models import SoftPromptModel
+        model = SoftPromptModel(model, prompt_length=prefix_prompt_config['num_prepend_tokens'])
+
+        for name, param in model.named_parameters():
+            if 'lora_' in name: # Target LoRA specific parameters
+                param.requires_grad = True
+                # Freeze classifier in original_modules (duplicates of modules_to_save).
+            if 'original_module' in name:
+                param.requires_grad = False
 
     elif finetune_mode == 'prefix+lora':
         print(f"   Fine-tuning mode: {finetune_mode} - Using Prefix Tuning ({prefix_prompt_config['num_prepend_tokens']} tokens) + LoRA (r={lora_config['r']}, alpha={lora_config['alpha']})")
@@ -246,7 +251,7 @@ def train_model_on_dataset(dataset_name):
         # 1. Apply Prefix Tuning
         prefix_config = PrefixTuningConfig(
             task_type=TaskType.SEQ_CLS,
-            num_virtual_tokens=prefix_prompt_config['num_prepend_tokens']
+            num_virtual_tokens=prefix_prompt_config['num_prepend_tokens'],
         )
         model = get_peft_model(model, prefix_config)
 
@@ -262,6 +267,10 @@ def train_model_on_dataset(dataset_name):
         )
         model = get_peft_model(model, lora_peft_config) # Apply LoRA to the prefix-tuned model
 
+        # 3. Set both adapters as active
+        model.base_model.set_adapter(["prefix", "lora"])
+        print("   Activated adapters: ['prefix', 'lora']")
+    
     elif finetune_mode == 'ia3':
         print(f"   Fine-tuning mode: {finetune_mode} - Using IA3")
         
@@ -291,14 +300,25 @@ def train_model_on_dataset(dataset_name):
     trainable_param_count = sum(p.numel() for p in trainable_params)
     
     # Detailed breakdown for PEFT methods if needed (optional, can be simplified)
-    if finetune_mode in ['prefix', 'soft-prompt', 'lora', 'ia3', 'soft-prompt+lora', 'prefix+lora']:
-        peft_params_count = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'classifier' not in n)
-        classifier_params_count = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'classifier' in n)
-        print(f"   Total trainable params: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)",
-              f"= PEFT {peft_params_count} ({peft_params_count/total_params:.2%})",
-              f"+ Classifier {classifier_params_count} ({classifier_params_count/total_params:.2%})")
-    else:
+    if finetune_mode == 'full':
         print(f"   Trainable parameters: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)")
+    else:
+        classifier_params_count = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'classifier' in n)
+        if finetune_mode in ['soft-prompt+lora', 'prefix+lora']:
+            # Calculate prompt/prefix and LoRA params separately for combined modes
+            lora_params_count = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'lora_' in n)
+            prompt_prefix_params_count = trainable_param_count - classifier_params_count - lora_params_count
+            
+            print(f"   Total trainable params: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)")
+            print(f"     = Prompt/Prefix: {prompt_prefix_params_count} ({prompt_prefix_params_count/total_params:.2%})")
+            print(f"     + LoRA: {lora_params_count} ({lora_params_count/total_params:.2%})")
+            print(f"     + Classifier: {classifier_params_count} ({classifier_params_count/total_params:.2%})")
+        else:
+            # Original calculation for single PEFT methods
+            peft_params_count = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'classifier' not in n)
+            print(f"   Total trainable params: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)",
+                  f"= PEFT {peft_params_count} ({peft_params_count/total_params:.2%})",
+                  f"+ Classifier {classifier_params_count} ({classifier_params_count/total_params:.2%})")
 
     # Tokenize datasetq
     tokenized_dataset = dataset.map(
