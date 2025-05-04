@@ -5,19 +5,30 @@ import evaluate
 from datetime import datetime
 import argparse
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import os
 from tqdm.auto import tqdm
 # Add PEFT library imports for LoRA, Prefix Tuning, and Prompt Tuning
 from peft import get_peft_model, LoraConfig, TaskType, PrefixTuningConfig, PromptTuningConfig
+# Import manual IA3 wrapper from custom_models
 import private_transformers.privacy_engine as pe_module
+import logging
+
+import warnings
+# Suppress the specific FutureWarning about non-full backward hooks on Modules
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message="Using non-full backward hooks on a Module that does not return a single Tensor or a tuple of Tensors is deprecated"
+)
 
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Fine-tune models with optional differential privacy')
 parser.add_argument('--finetune_mode', type=str, default='full', 
-                    choices=['full', 'last-layer', 'lora', 'ai3', 'prefix', 'soft-prompt'], 
-                    help='Fine-tuning mode: "full" for all layers, "last-layer" for classifier only, "lora" for LoRA, "ai3" for AI3 method, "prefix" for Prefix Tuning, or "soft-prompt" for Soft-prompt Tuning')
+                    choices=['full', 'last-layer', 'lora', 'ia3', 'prefix', 'soft-prompt', 'soft-prompt+lora', 'prefix+lora'], 
+                    help='Fine-tuning mode: "full" for all layers, "last-layer" for classifier only, "lora" for LoRA, "ia3" for IA3 method, "prefix" for Prefix Tuning, "soft-prompt" for Soft-prompt Tuning, "soft-prompt+lora" for combined Soft-prompt and LoRA, or "prefix+lora" for combined Prefix Tuning and LoRA')
 parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for optimizer')
 parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
 parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training and evaluation')
@@ -122,15 +133,19 @@ def evaluate_model(model, eval_dataloader, device, num_labels):
 
 # Main training function
 def train_model_on_dataset(dataset_name):
-    print(f">> Training on {dataset_name} dataset... (ε={dp_config['target_epsilon'] if enable_dp else '∞'}, δ={dp_config['max_grad_norm'] if enable_dp else '∞'})")
+    print(f">> Training on {dataset_name} dataset...",
+          f" (ε={dp_config['target_epsilon'] if enable_dp else '∞'},",
+          f" clip_grad={dp_config['max_grad_norm'] if enable_dp else '∞'})")
     print(f"   Learning rate: {learning_rate}, Batch size: {batch_size}, Epochs: {epochs}")
-    print(f"   Fine-tuning mode: {finetune_mode}")
     
     # Load dataset
     dataset = load_dataset("glue", dataset_name)
     
     # Determine number of labels for the dataset
     num_labels = 3 if dataset_name == "mnli" else 2
+    
+    # Suppress the specific transformers warning about newly initialized weights
+    logging.getLogger("transformers").setLevel(logging.ERROR)
     
     # Load model with appropriate number of labels
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -140,12 +155,25 @@ def train_model_on_dataset(dataset_name):
     
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
     
-    # Setup trainable parameters based on fine-tuning mode
-    trainable_params = []
+    # Freeze all parameters first. Classification layer is always trainable
+    for name, param in model.named_parameters():
+        if 'classifier' in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
     
-    if finetune_mode == 'lora':
-        print(f"Fine-tuning mode: {finetune_mode} - Using LoRA with rank={lora_config['r']}, alpha={lora_config['alpha']}, dropout={lora_config['dropout']}")
+    if finetune_mode == 'full':
+        print(f"   Fine-tuning mode: {finetune_mode} - Training all parameters")
+        for name, param in model.named_parameters():
+            param.requires_grad = True
+
+    elif finetune_mode == 'last-layer':
+        print(f"   Fine-tuning mode: {finetune_mode} - Only training the classifier layer")
+
+    elif finetune_mode == 'lora':
+        print(f"   Fine-tuning mode: {finetune_mode} - Using LoRA with rank={lora_config['r']}, alpha={lora_config['alpha']}, dropout={lora_config['dropout']}")
         
         # Configure LoRA
         peft_config = LoraConfig(
@@ -154,130 +182,125 @@ def train_model_on_dataset(dataset_name):
             lora_alpha=lora_config['alpha'],
             lora_dropout=lora_config['dropout'],
             bias="none",
-            target_modules=["query", "key", "value"]
+            target_modules=["query", "key", "value"],
+            modules_to_save=["classifier"], # Will be set as trainable and saved in the final checkpoint
         )
-        
-        # Get the PEFT model
         model = get_peft_model(model, peft_config)
-        # Move to device after LoRA transformation
-        model = model.to(device)
         
-        # Get trainable parameters
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        
-        # Calculate trainable parameters
-        trainable_param_count = sum(p.numel() for p in trainable_params)
-        total_params = sum(p.numel() for p in model.parameters())
-        print(f"Trainable parameters: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)")
-    
     elif finetune_mode == 'prefix':
-        print(f"Fine-tuning mode: {finetune_mode} - Using Prefix Tuning with {prefix_prompt_config['num_prepend_tokens']} tokens + Classifier")
+        print(f"   Fine-tuning mode: {finetune_mode} - Using Prefix Tuning with {prefix_prompt_config['num_prepend_tokens']} tokens")
         
         # Configure Prefix Tuning
         peft_config = PrefixTuningConfig(
             task_type=TaskType.SEQ_CLS,
             num_virtual_tokens=prefix_prompt_config['num_prepend_tokens']
         )
-        
-        # Get the PEFT model
         model = get_peft_model(model, peft_config)
-        # Move to device after PEFT transformation
-        model = model.to(device)
         
-        # Also make classifier trainable
         for name, param in model.named_parameters():
             if 'classifier' in name:
                 param.requires_grad = True
-        
-        # Get trainable parameters (PEFT + Classifier)
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        
-        # Calculate trainable parameters breakdown
-        total_params = sum(p.numel() for p in model.parameters())
-        peft_params_count = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'classifier' not in n)
-        classifier_params_count = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'classifier' in n)
-        trainable_param_count = peft_params_count + classifier_params_count
-        
-        print(f"  PEFT params: {peft_params_count} ({peft_params_count/total_params:.2%})")
-        print(f"  Classifier params: {classifier_params_count} ({classifier_params_count/total_params:.2%})")
-        print(f"  Total trainable params: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)")
 
     elif finetune_mode == 'soft-prompt':
-        print(f"Fine-tuning mode: {finetune_mode} - Using Soft-prompt Tuning with {prefix_prompt_config['num_prepend_tokens']} tokens + Classifier")
+        print(f"   Fine-tuning mode: {finetune_mode} - Using Soft-prompt Tuning with {prefix_prompt_config['num_prepend_tokens']} tokens")
         
-        # Configure Soft Prompt Tuning
-        peft_config = PromptTuningConfig(
+        # # Configure Soft Prompt Tuning
+        # peft_config = PromptTuningConfig(
+        #     task_type=TaskType.SEQ_CLS,
+        #     num_virtual_tokens=prefix_prompt_config['num_prepend_tokens']   
+        # )
+        # model = get_peft_model(model, peft_config)
+        from custom_models import SoftPromptModel
+        model = SoftPromptModel(model, prompt_length=prefix_prompt_config['num_prepend_tokens'])
+        
+        
+        for name, param in model.named_parameters():
+            if 'classifier' in name:
+                param.requires_grad = True
+
+    elif finetune_mode == 'soft-prompt+lora':
+        print(f"   Fine-tuning mode: {finetune_mode} - Using Soft-prompt Tuning ({prefix_prompt_config['num_prepend_tokens']} tokens) + LoRA (r={lora_config['r']}, alpha={lora_config['alpha']})")
+        
+        # 1. Apply Soft Prompt Tuning
+        prompt_config = PromptTuningConfig(
             task_type=TaskType.SEQ_CLS,
             num_virtual_tokens=prefix_prompt_config['num_prepend_tokens']   
         )
-        
-        # Get the PEFT model
-        model = get_peft_model(model, peft_config)
-        # Move to device after PEFT transformation
-        model = model.to(device)
+        model = get_peft_model(model, prompt_config)
 
-        # Also make classifier trainable
+        # 2. Apply LoRA on top
+        lora_peft_config = LoraConfig(
+            task_type=TaskType.SEQ_CLS,
+            r=lora_config['r'],
+            lora_alpha=lora_config['alpha'],
+            lora_dropout=lora_config['dropout'],
+            bias="none",
+            target_modules=["query", "key", "value"], # Apply LoRA to attention layers
+            modules_to_save=["classifier"], # Will be set as trainable and saved in the final checkpoint
+        )
+        model = get_peft_model(model, lora_peft_config) # Apply LoRA to the prompt-tuned model
+
+    elif finetune_mode == 'prefix+lora':
+        print(f"   Fine-tuning mode: {finetune_mode} - Using Prefix Tuning ({prefix_prompt_config['num_prepend_tokens']} tokens) + LoRA (r={lora_config['r']}, alpha={lora_config['alpha']})")
+        
+        # 1. Apply Prefix Tuning
+        prefix_config = PrefixTuningConfig(
+            task_type=TaskType.SEQ_CLS,
+            num_virtual_tokens=prefix_prompt_config['num_prepend_tokens']
+        )
+        model = get_peft_model(model, prefix_config)
+
+        # 2. Apply LoRA on top
+        lora_peft_config = LoraConfig(
+            task_type=TaskType.SEQ_CLS,
+            r=lora_config['r'],
+            lora_alpha=lora_config['alpha'],
+            lora_dropout=lora_config['dropout'],
+            bias="none",
+            target_modules=["query", "key", "value"], # Apply LoRA to attention layers
+            modules_to_save=["classifier"], # Will be set as trainable and saved in the final checkpoint
+        )
+        model = get_peft_model(model, lora_peft_config) # Apply LoRA to the prefix-tuned model
+
+    elif finetune_mode == 'ia3':
+        print(f"   Fine-tuning mode: {finetune_mode} - Using IA3")
+        
+        # Configure IA3 using PEFT
+        # peft_config = IA3Config(
+        #     task_type=TaskType.SEQ_CLS,
+        #     feedforward_modules=["intermediate.dense"], # Apply scaling to the intermediate layer of FFN
+        #     modules_to_save=["classifier"], # Will be set as trainable and saved in the final checkpoint
+        # )
+        # model = get_peft_model(model, peft_config)
+        from custom_models import wrap_bert_for_ia3, clamp_to_diagonal
+        model = wrap_bert_for_ia3(model)
+        
         for name, param in model.named_parameters():
-            if 'classifier' in name:
+            if 'classifier' in name or 'ia3' in name:
                 param.requires_grad = True
-        
-        # Get trainable parameters (PEFT + Classifier)
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        
-        # Calculate trainable parameters breakdown
-        total_params = sum(p.numel() for p in model.parameters())
+
+    else:
+        # return error if finetune_mode is not recognized
+        raise ValueError(f"Unknown fine-tuning mode: {finetune_mode}.")
+
+    # Collect all trainable parameters *after* all modifications
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    
+    # Calculate and print trainable parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_param_count = sum(p.numel() for p in trainable_params)
+    
+    # Detailed breakdown for PEFT methods if needed (optional, can be simplified)
+    if finetune_mode in ['prefix', 'soft-prompt', 'lora', 'ia3', 'soft-prompt+lora', 'prefix+lora']:
         peft_params_count = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'classifier' not in n)
         classifier_params_count = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'classifier' in n)
-        trainable_param_count = peft_params_count + classifier_params_count
+        print(f"   Total trainable params: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)",
+              f"= PEFT {peft_params_count} ({peft_params_count/total_params:.2%})",
+              f"+ Classifier {classifier_params_count} ({classifier_params_count/total_params:.2%})")
+    else:
+        print(f"   Trainable parameters: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)")
 
-        print(f"  PEFT params: {peft_params_count} ({peft_params_count/total_params:.2%})")
-        print(f"  Classifier params: {classifier_params_count} ({classifier_params_count/total_params:.2%})")
-        print(f"  Total trainable params: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)")
-
-    elif finetune_mode == 'ai3':
-        print(f"Fine-tuning mode: {finetune_mode} - Only training attention and intermediate layers")
-        model = model.to(device)
-        
-        # Freeze all layers first
-        for param in model.parameters():
-            param.requires_grad = False
-        
-        # Only unfreeze attention and intermediate layers (AI3 approach)
-        for name, param in model.named_parameters():
-            if any(keyword in name for keyword in ["attention", "intermediate", "classifier"]):
-                param.requires_grad = True
-                trainable_params.append(param)
-        
-        # Calculate trainable parameters
-        trainable_param_count = sum(p.numel() for p in trainable_params)
-        total_params = sum(p.numel() for p in model.parameters())
-        print(f"Trainable parameters: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)")
-    
-    elif finetune_mode == 'last-layer':
-        print(f"Fine-tuning mode: {finetune_mode} - Only training the classifier layer")
-        model = model.to(device)
-        
-        # Freeze all layers except the classifier
-        for name, param in model.named_parameters():
-            if 'classifier' in name:
-                trainable_params.append(param)
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-                
-        # Check and print trainable parameters
-        trainable_param_count = sum(p.numel() for p in trainable_params)
-        total_params = sum(p.numel() for p in model.parameters())
-        print(f"Trainable parameters: {trainable_param_count} ({trainable_param_count/total_params:.2%} of total)")
-    
-    else:  # full fine-tuning
-        print(f"Fine-tuning mode: {finetune_mode} - Training all parameters")
-        model = model.to(device)
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        total_params = sum(p.numel() for p in model.parameters())
-        print(f"Trainable parameters: {total_params} (100% of total)")
-    
-    # Tokenize dataset
+    # Tokenize datasetq
     tokenized_dataset = dataset.map(
         lambda examples: tokenize_function(examples, dataset_name),
         batched=True
@@ -329,12 +352,12 @@ def train_model_on_dataset(dataset_name):
         # monkey-patch private_transformers package bypass unsupported models
         if type(model) not in pe_module.SUPPORTED_TRANSFORMERS:
             pe_module.SUPPORTED_TRANSFORMERS += (type(model),)
-        
+
         privacy_engine = pe_module.PrivacyEngine(
             model,
             batch_size=batch_size * (torch.cuda.device_count() if torch.cuda.is_available() else 1),
             sample_size=len(tokenized_dataset["train"]),
-            epochs=epochs,  
+            epochs=epochs,
             max_grad_norm=dp_config['max_grad_norm'],
             target_epsilon=dp_config['target_epsilon'],
         )
@@ -381,6 +404,11 @@ def train_model_on_dataset(dataset_name):
                 # Calculate mean loss for reporting
                 batch_loss = loss.mean().item()
             
+            if 'ia3' in finetune_mode:
+                for name, weights in model.named_parameters():
+                    if 'ia3' in name:
+                        clamp_to_diagonal(weights)
+            
             total_loss += batch_loss
             num_batches += 1
             progress_bar.set_postfix({"loss": batch_loss})
@@ -421,9 +449,10 @@ def train_model_on_dataset(dataset_name):
     
     # Print final results
     print(f"\n===== {dataset_name.upper()} RESULTS =====")
-    print(f"  Best accuracy: {best_accuracy:.4f}")
-    print(f"  Final accuracy: {final_eval_results['accuracy']:.4f}")
+    print(f"   Best accuracy: {best_accuracy:.4f}")
+    print(f"   Final accuracy: {final_eval_results['accuracy']:.4f}")
     print("=" * 30)
+    print()
     
     final_eval_results["best_accuracy"] = best_accuracy
     return final_eval_results
@@ -439,17 +468,16 @@ for dataset_name in datasets_to_train:
 
 # Print summary of results with DP information
 print("\n===== SUMMARY OF RESULTS =====")
-print(f"Training with Differential Privacy: {enable_dp}")
-if enable_dp:
-    print(f"  ε={dp_config['target_epsilon']}, δ={dp_config['max_grad_norm']}")
-print(f"Fine-tuning mode: {finetune_mode}")
-if finetune_mode == 'lora':
-    print(f"  LoRA config: rank={lora_config['r']}, alpha={lora_config['alpha']}, dropout={lora_config['dropout']}")
-if finetune_mode in ['prefix', 'soft-prompt']:
-    print(f"  Prefix/Soft-prompt config: num_prepend_tokens={prefix_prompt_config['num_prepend_tokens']}")
-print(f"Learning rate: {learning_rate}")
-print(f"Batch size: {batch_size}")
-print(f"Epochs: {epochs}")
+print(f"Training with Differential Privacy: {enable_dp}",
+      f"(ε={dp_config['target_epsilon'] if enable_dp else '∞'},",
+      f"clip_grad={dp_config['max_grad_norm'] if enable_dp else '∞'})")
+print(f"Fine-tuning mode: {finetune_mode}", end=" ")
+if 'lora' in finetune_mode: # Check if 'lora' is part of the mode name
+    print(f"(LoRA config: rank={lora_config['r']}, alpha={lora_config['alpha']}, dropout={lora_config['dropout']})", end=" ")
+if 'prefix' in finetune_mode or 'soft-prompt' in finetune_mode: # Check if 'prefix' or 'soft-prompt' is part of the mode name
+    print(f"(Prefix/Soft-prompt config: num_prepend_tokens={prefix_prompt_config['num_prepend_tokens']})", end=" ")
+print()
+print(f"Learning rate: {learning_rate}, Batch size: {batch_size}, Epochs: {epochs}")
 print("=" * 30)
 for dataset_name, result in results.items():
     print(f"{dataset_name}: {result}")
