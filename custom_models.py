@@ -24,14 +24,12 @@ class IA3Scaling(nn.Module):
         out = self.ia3_alpha(out)  # Element-wise scaling via diagonal linear layer
         return out
 
-
 @torch.no_grad()
 def clamp_to_diagonal(weight):
     with torch.no_grad():
         W = weight.data
         mask = torch.eye(W.size(0), device=W.device)
         W *= mask
-
 
 def wrap_bert_for_ia3(model):
     device = next(model.parameters()).device
@@ -41,9 +39,7 @@ def wrap_bert_for_ia3(model):
             attr = name.split('.')[-1]
             original = getattr(parent, attr)
             setattr(parent, attr, IA3Scaling(original, device))
-    
     return model
-
 
 def get_parent_module(model, module_name):
     parts = module_name.split(".")
@@ -52,6 +48,7 @@ def get_parent_module(model, module_name):
         parent = getattr(parent, p)
     return parent
 ### end ia3
+
 
 ### for soft prompt
 class SoftPromptEmbedding(nn.Module):
@@ -72,7 +69,6 @@ class SoftPromptModel(nn.Module):
 
         embedding_dim = base_model.bert.embeddings.word_embeddings.embedding_dim
         model_device = next(base_model.parameters()).device
-
         self.soft_prompt_module = SoftPromptEmbedding(prompt_length, embedding_dim, model_device)
 
         # Freeze base model initially
@@ -104,7 +100,7 @@ class SoftPromptModel(nn.Module):
         # STEP 1: Expand soft prompts for batch
         expanded_prompt = self.soft_prompt_module.soft_prompt.unsqueeze(0).expand(batch_size, -1, -1)
 
-        # STEP 2: Register hook that assigns grad_sample directly to the soft_prompt Parameter
+        # STEP 2: Assign grad_sample directly to soft_prompt (required for DP optimization)
         def capture_grad_sample(grad):
             self.soft_prompt_module.soft_prompt.grad_sample = grad.detach().clone()
 
@@ -155,114 +151,80 @@ class SoftPromptModel(nn.Module):
             json.dump(config, f)
 ### end soft prompt
 
-class PrefixTuningModel(nn.Module):
-    """Wrapper for models with prefix tuning.
-    
-    This adds N learnable prefix vectors to each transformer layer.
-    Only these prefix vectors are trained, while the rest of the model is frozen.
-    """
-    
+
+### for prefix tuning
+class PrefixEmbedding(nn.Module):
+    def __init__(self, prefix_length, hidden_dim, device):
+        super().__init__()
+        self.prefix = nn.Parameter(torch.randn(prefix_length, hidden_dim, device=device))
+
+    def forward(self, batch_size):
+        expanded = self.prefix.unsqueeze(0).expand(batch_size, -1, -1) # [batch_size, prefix_len, hidden_dim]
+
+        # Attach hook to output, not parameter, to capture *per-sample* gradients
+        def _capture_grad_sample(grad):
+            if grad.dim() != 3:
+                raise RuntimeError(f"Expected [B, P, D], got: {grad.shape}")
+            self.prefix.grad_sample = grad.detach()
+
+        expanded.register_hook(_capture_grad_sample)
+        return expanded
+
+class PrefixModel(nn.Module):
     def __init__(self, base_model, prefix_length=10):
         super().__init__()
         self.base_model = base_model
         self.prefix_length = prefix_length
-        
-        # Get key and value dimensions from the base model
-        model_config = base_model.config
-        self.n_layers = getattr(model_config, "num_hidden_layers", None)        
-        self.hidden_size = getattr(model_config, "hidden_size", None)
-        
-        # Create prefix parameters for each layer
-        # We need key and value prefix for each attention head in each layer
-        self.prefix_key_values = nn.ParameterList()
-        
-        # For each layer, create prefix parameters for both keys and values
-        for i in range(self.n_layers):
-            # Create the parameter for this layer (keys and values)
-            # Shape: [prefix_length, 2, hidden_size]
-            # The 2 is for key and value
-            layer_prefix = nn.Parameter(torch.randn(prefix_length, 2, self.hidden_size))
-            self.prefix_key_values.append(layer_prefix)
-        
-        # Freeze the base model parameters
+
+        # Access encoder layers (adapt for different architectures if needed)
+        self.encoder_layers = base_model.bert.encoder.layer
+        self.num_layers = len(self.encoder_layers)
+        hidden_size = base_model.config.hidden_size
+        device = next(base_model.parameters()).device
+
+        # Create separate prefix for each layer
+        self.prefix_modules = nn.ModuleList([
+            PrefixEmbedding(prefix_length, hidden_size, device)
+            for _ in range(self.num_layers)
+        ])
+
+        self._register_prefix_hooks()
+
+        # Freeze base model
         for param in self.base_model.parameters():
             param.requires_grad = False
-            
-        # Record which parameters should be optimized
-        self.trainable_params = list(self.prefix_key_values)
-            
-        # Store the original forward functions for each layer to modify them
-        self._store_original_forward_functions()
-        
-        # Replace the forward functions with our custom ones
-        self._replace_forward_functions()
-    
-    def _store_original_forward_functions(self):
-        """Store the original attention forward functions to restore later if needed."""
-        self.original_forward_funcs = {}
-        
-        for i, layer in enumerate(self.base_model.bert.encoder.layer):
-            self.original_forward_funcs[i] = layer.attention.self.forward
-    
-    def _replace_forward_functions(self):
-        """Replace the forward functions of self-attention layers with our custom ones."""
-        layers = self.base_model.bert.encoder.layer
-        
-        for i, layer in enumerate(layers):
-            # Get the prefix parameters for this layer
-            layer_prefix = self.prefix_key_values[i]
-            
-            # Define custom forward function with prefix
-            def make_custom_forward(layer_idx, orig_forward):
-                def custom_forward(self, *args, **kwargs):
-                    # Call original forward function
-                    outputs = orig_forward(self, *args, **kwargs)
-                    
-                    # Get batch size from hidden states
-                    if 'hidden_states' in kwargs:
-                        batch_size = kwargs['hidden_states'].size(0)
-                    else:
-                        batch_size = args[0].size(0)
-                    
-                    # Get prefix for this layer
-                    prefix_params = layer_prefix
-                    
-                    # Expand for batch size
-                    # From [prefix_length, 2, hidden_size] to [batch_size, prefix_length, 2, hidden_size]
-                    expanded_prefix = prefix_params.unsqueeze(0).expand(batch_size, -1, -1, -1)
-                    
-                    # Reshape to separate key and value
-                    # [batch_size, prefix_length, 2, hidden_size] -> [2, batch_size, prefix_length, hidden_size]
-                    expanded_prefix = expanded_prefix.permute(2, 0, 1, 3)
-                    
-                    # Now we have separate key and value prefixes
-                    prefix_keys = expanded_prefix[0]  # [batch_size, prefix_length, hidden_size]
-                    prefix_values = expanded_prefix[1]  # [batch_size, prefix_length, hidden_size]
-                    
-                    # Prepend to the key and value tensors
-                    if isinstance(outputs, tuple):
-                        # Most models return (attention_output, attention_weights)
-                        key_states = outputs[0]  # [batch_size, seq_len, hidden_size]
-                        value_states = outputs[1]  # [batch_size, seq_len, hidden_size]
-                        
-                        # Prepend prefix
-                        key_states_with_prefix = torch.cat([prefix_keys, key_states], dim=1)
-                        value_states_with_prefix = torch.cat([prefix_values, value_states], dim=1)
-                        
-                        return (key_states_with_prefix, value_states_with_prefix, *outputs[2:])
-                    else:
-                        # Return modified outputs
-                        return outputs
-                
-                return custom_forward
-            
-            # Monkey-patch the forward function
-            layer.attention.self.forward = make_custom_forward(i, self.original_forward_funcs[i])
-    
+
+        # Enable training for prefixes and classifier
+        self.trainable_params = list(self.prefix_modules.parameters()) + list(self.base_model.classifier.parameters())
+        for param in self.trainable_params:
+            param.requires_grad = True
+
+    def _register_prefix_hooks(self):
+        def prepend_prefix_hook(layer_id):
+            def hook(module, input):
+                hidden_states = input[0]  # [B, T, D]
+                batch_size = hidden_states.size(0)
+                prefix = self.prefix_modules[layer_id](batch_size)  # [B, P, D]
+                new_hidden_states = torch.cat([prefix, hidden_states], dim=1)
+                return (new_hidden_states,)
+            return hook
+
+        for i, layer in enumerate(self.encoder_layers):
+            layer.register_forward_pre_hook(prepend_prefix_hook(i))
+
     def forward(self, *args, **kwargs):
-        """Forward pass, delegating to the base model after adjusting inputs for prefix."""
         return self.base_model(*args, **kwargs)
-    
-    def get_trainable_parameters(self):
-        """Returns the parameters that should be trained."""
-        return self.trainable_params
+
+    def save_pretrained(self, save_directory):
+        os.makedirs(save_directory, exist_ok=True)
+        
+        for i, prefix in enumerate(self.prefix_modules):
+            torch.save(prefix.state_dict(), os.path.join(save_directory, f"prefix_layer_{i}.pt"))
+
+        torch.save(self.base_model.classifier.state_dict(), os.path.join(save_directory, "classifier.pt"))
+        with open(os.path.join(save_directory, "config.json"), "w") as f:
+            json.dump({
+                "prefix_length": self.prefix_length,
+                "num_layers": self.num_layers
+            }, f)
+### end prefix tuning
