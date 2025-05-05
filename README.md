@@ -1,4 +1,6 @@
 # LLM Fine-tuning with Differential Privacy
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](
+https://colab.research.google.com/drive/18GXgZSb1dQLMiZo8y-Kh8a8VmDoCAPMG?usp=copy)
 
 This project provides a framework for fine-tuning LLMs (e.g., BERT) on various GLUE benchmark tasks using different fine-tuning methods and optional Differential Privacy (DP).
 
